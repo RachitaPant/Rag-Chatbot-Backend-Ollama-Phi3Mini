@@ -1,6 +1,11 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import os
+import glob
+from pypdf import PdfReader
+from gtts import gTTS
 
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
@@ -11,9 +16,6 @@ from langchain_core.documents import Document
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains.retrieval import create_retrieval_chain
 
-import os
-import glob
-from pypdf import PdfReader
 
 app = FastAPI()
 
@@ -30,6 +32,9 @@ app.add_middleware(
 DATA_DIR = "data"
 VECTOR_DIR = "vectorstore"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+AUDIO_DIR = "audio"
+
+os.makedirs(AUDIO_DIR, exist_ok=True)
 
 def load_docs():
     docs = []
@@ -71,7 +76,10 @@ try:
     vectordb = get_vectorstore()
     retriever = vectordb.as_retriever(search_kwargs={"k": 3})
 
-    prompt_template = """You are a helpful assistant that answers questions based solely on the provided documents. Use only the information from the documents to generate your response. If the documents do not contain the information needed to answer the question, respond with: "I don't have the information in the provided context." Do not use any external knowledge or make assumptions.
+    prompt_template = """You are a helpful assistant that answers questions based solely on the provided documents. 
+Use only the information from the documents to generate your response. 
+If the documents do not contain the information needed to answer the question, respond with: 
+"I don't have the information in the provided context."
 
 Documents:
 {context}
@@ -83,7 +91,6 @@ Answer:"""
 
     llm = OllamaLLM(model="phi3:3.8b-mini-128k-instruct-q4_0", timeout=60)
 
-    # Stuff retrieved documents into prompt and LLM
     combine_docs_chain = create_stuff_documents_chain(llm, PROMPT)
     qa_chain = create_retrieval_chain(retriever, combine_docs_chain)
 except Exception as e:
@@ -98,15 +105,30 @@ async def ask(query: Query):
     try:
         print(f"Received question: {query.question}")
         result = qa_chain.invoke({"input": query.question})
-        print(f"Chain result: {result}")
+        answer = result.get("answer", "I could not generate an answer.")
+        print(f"Answer: {answer}")
+
+        # Generate audio file with Indian female voice (Google India domain)
+        audio_file = os.path.join(AUDIO_DIR, "response.mp3")
+        tts = gTTS(text=answer, lang="en", tld="co.in")  # <-- Indian English female
+        tts.save(audio_file)
 
         return {
-            "answer": result.get("answer"),
-            "sources": [doc.metadata for doc in result.get("context", [])]
+            "answer": answer,
+            "sources": [doc.metadata for doc in result.get("context", [])],
+            "audio_url": f"/audio/response.mp3"
         }
     except Exception as e:
         print(f"Error in /ask endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing query: {e}")
+
+# Serve audio files
+@app.get("/audio/{filename}")
+async def get_audio(filename: str):
+    file_path = os.path.join(AUDIO_DIR, filename)
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(file_path, media_type="audio/mpeg")
 
 if __name__ == "__main__":
     import uvicorn

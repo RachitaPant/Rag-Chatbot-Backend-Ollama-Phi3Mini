@@ -5,3 +5,4 @@ chromadb
 sentence-transformers
 pypdf
 ollama
+gtts
