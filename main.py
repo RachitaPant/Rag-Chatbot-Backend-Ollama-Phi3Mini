@@ -1,15 +1,17 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.llms import Ollama
+
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+from langchain_ollama import OllamaLLM
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain.docstore.document import Document
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
+from langchain_core.documents import Document
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains.retrieval import create_retrieval_chain
+
 import os
-from pathlib import Path
 import glob
 from pypdf import PdfReader
 
@@ -29,62 +31,83 @@ DATA_DIR = "data"
 VECTOR_DIR = "vectorstore"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Load / process documents
 def load_docs():
     docs = []
     for filepath in glob.glob(os.path.join(DATA_DIR, "*.pdf")):
-        reader = PdfReader(filepath)
-        text = "\n".join([page.extract_text() for page in reader.pages if page.extract_text()])
-        docs.append(Document(page_content=text,metadata={"source":filepath}))
+        try:
+            reader = PdfReader(filepath)
+            text = "\n".join([
+                page.extract_text() for page in reader.pages if page.extract_text()
+            ])
+            docs.append(Document(page_content=text, metadata={"source": filepath}))
+        except Exception as e:
+            print(f"Error loading PDF {filepath}: {e}")
+
     for filepath in glob.glob(os.path.join(DATA_DIR, "*.txt")):
-        with open(filepath, "r", encoding="utf-8") as f:
-            docs.append(Document(page_content=f.read(),metadata={"source":filepath}))
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                docs.append(Document(page_content=f.read(), metadata={"source": filepath}))
+        except Exception as e:
+            print(f"Error loading text file {filepath}: {e}")
+
     return docs
 
-# Build or load vector DB
 def get_vectorstore():
     embeddings = HuggingFaceEmbeddings(model_name=EMBED_MODEL)
-    vectordb = Chroma(persist_directory=VECTOR_DIR, embedding_function=embeddings)
     if not os.path.exists(VECTOR_DIR) or not os.listdir(VECTOR_DIR):
         docs = load_docs()
-        printf(f"Loaded {len(docs)} documents")
-        for doc in docs:
-            print(f"Document from {doc.metadata.get('source','unknown')}:{doc.page_content[:100]}...")
-        splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=25)  # Smaller chunks for 8 GB RAM
+        if not docs:
+            raise ValueError("No documents found in the data directory.")
+        print(f"Loaded {len(docs)} documents.")
+        splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=25)
         splits = splitter.split_documents(docs)
         vectordb = Chroma.from_documents(splits, embeddings, persist_directory=VECTOR_DIR)
-        vectordb.persist()
+    else:
+        vectordb = Chroma(persist_directory=VECTOR_DIR, embedding_function=embeddings)
     return vectordb
 
-#custom prompt template
-prompt_template="""You are a helpful assitant that answers questions based solely on the provided documents. Use only the information from the documentsto generate your response, if the documents do not contain the information needed to answer the question, respond with :"I dont have the information in the provided context."Do not use any external knowledge or make assumptions
+# Initialize vector store, retriever, chains
+try:
+    vectordb = get_vectorstore()
+    retriever = vectordb.as_retriever(search_kwargs={"k": 3})
+
+    prompt_template = """You are a helpful assistant that answers questions based solely on the provided documents. Use only the information from the documents to generate your response. If the documents do not contain the information needed to answer the question, respond with: "I don't have the information in the provided context." Do not use any external knowledge or make assumptions.
 
 Documents:
 {context}
 
-Question:{question}
+Question: {input}
 
 Answer:"""
+    PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "input"])
 
+    llm = OllamaLLM(model="phi3:3.8b-mini-128k-instruct-q4_0", timeout=60)
 
-PROMPT=PromptTemplate(
-    template=prompt_template,input_variables=["context","question"]
-)
+    # Stuff retrieved documents into prompt and LLM
+    combine_docs_chain = create_stuff_documents_chain(llm, PROMPT)
+    qa_chain = create_retrieval_chain(retriever, combine_docs_chain)
+except Exception as e:
+    print(f"Error initializing chain: {e}")
+    raise
 
-# Create retriever + LLM
-vectordb = get_vectorstore()
-retriever = vectordb.as_retriever(search_kwargs={"k":3})
-llm = Ollama(model="phi3:3.8b-mini-128k-instruct-q4_0")  # Use Phi-3
-qa = RetrievalQA.from_chain_type(llm=llm, retriever=retriever,chain_type_kwargs={"prompt":PROMPT})
-
-# API models
 class Query(BaseModel):
     question: str
 
 @app.post("/ask")
 async def ask(query: Query):
     try:
-        answer = qa.invoke({"query": query.question})
-        return {"answer": answer["result"]}
+        print(f"Received question: {query.question}")
+        result = qa_chain.invoke({"input": query.question})
+        print(f"Chain result: {result}")
+
+        return {
+            "answer": result.get("answer"),
+            "sources": [doc.metadata for doc in result.get("context", [])]
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing query: {str(e)}")
+        print(f"Error in /ask endpoint: {e}")
+        raise HTTPException(status_code=500, detail=f"Error processing query: {e}")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
